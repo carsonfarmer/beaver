@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+
+# Build artifacts
+bin/
+/beaver
+
+# Data / sessions
+.beaver/
+
+# Dependencies (vendored locally)
+.deps/
+
+# IDE / editor
+.claude/
+.acpxrc.json
+.DS_Store
+
+# Agent runtime
+.agents/
+
+# OS
+*.swp
+*~
