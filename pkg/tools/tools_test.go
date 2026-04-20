@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"charm.land/fantasy"
+
 	acp "github.com/ironpark/go-acp"
 )
 
@@ -15,9 +16,17 @@ type mockClient struct {
 	writeErr       error
 	terminalOutput string
 	terminalErr    error
+	sessionUpdate  func(*acp.SessionNotification) error
+	updates        []*acp.SessionNotification
 }
 
-func (m *mockClient) SessionUpdate(_ context.Context, _ *acp.SessionNotification) error { return nil }
+func (m *mockClient) SessionUpdate(_ context.Context, n *acp.SessionNotification) error {
+	m.updates = append(m.updates, n)
+	if m.sessionUpdate != nil {
+		return m.sessionUpdate(n)
+	}
+	return nil
+}
 func (m *mockClient) RequestPermission(_ context.Context, _ *acp.RequestPermissionRequest) (*acp.RequestPermissionResponse, error) {
 	return nil, nil
 }
@@ -56,6 +65,11 @@ func mockToolCall(name, input string) fantasy.ToolCall {
 	return fantasy.ToolCall{ID: "test-tc", Name: name, Input: input}
 }
 
+// testCtx returns a context with a session ID set for tool tests.
+func testCtx() context.Context {
+	return WithSessionID(context.Background(), "test-sess")
+}
+
 func TestRunCommand_Success(t *testing.T) {
 	out, err := RunCommand(context.Background(), &mockClient{terminalOutput: "hello\n"}, "s", "echo", []string{"hello"})
 	if err != nil {
@@ -73,22 +87,23 @@ func TestRunCommand_Error(t *testing.T) {
 	}
 }
 
-func TestForSession_Names(t *testing.T) {
-	tools := ForSession(&mockClient{}, "test-sess")
-	want := []string{"read_file", "write_file", "execute"}
-	if len(tools) != len(want) {
-		t.Fatalf("expected %d tools, got %d", len(want), len(tools))
+func TestToolKinds(t *testing.T) {
+	wantKinds := map[string]acp.ToolKind{
+		ReadName:    acp.ToolKindRead,
+		WriteName:   acp.ToolKindEdit,
+		ExecuteName: acp.ToolKindExecute,
+		PlanName:    acp.ToolKindThink,
 	}
-	for i, name := range want {
-		if got := tools[i].Info().Name; got != name {
-			t.Errorf("tool[%d]: expected %q, got %q", i, name, got)
+	for name, want := range wantKinds {
+		if got := ToolKinds[name]; got != want {
+			t.Errorf("ToolKinds[%q] = %q, want %q", name, got, want)
 		}
 	}
 }
 
-func TestForSession_ReadFile_Success(t *testing.T) {
-	tools := ForSession(&mockClient{readContent: "hello world"}, "test-sess")
-	resp, err := tools[0].Run(context.Background(), mockToolCall("read_file", `{"path":"/tmp/test.txt"}`))
+func TestReadFile_Success(t *testing.T) {
+	tool := NewReadFileTool(&mockClient{readContent: "hello world"})
+	resp, err := tool.Run(testCtx(), mockToolCall(ReadName, `{"path":"/tmp/test.txt"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,9 +112,9 @@ func TestForSession_ReadFile_Success(t *testing.T) {
 	}
 }
 
-func TestForSession_ReadFile_Error(t *testing.T) {
-	tools := ForSession(&mockClient{readErr: fmt.Errorf("not found")}, "test-sess")
-	resp, err := tools[0].Run(context.Background(), mockToolCall("read_file", `{"path":"/tmp/nope"}`))
+func TestReadFile_Error(t *testing.T) {
+	tool := NewReadFileTool(&mockClient{readErr: fmt.Errorf("not found")})
+	resp, err := tool.Run(testCtx(), mockToolCall(ReadName, `{"path":"/tmp/nope"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,9 +123,9 @@ func TestForSession_ReadFile_Error(t *testing.T) {
 	}
 }
 
-func TestForSession_WriteFile_Success(t *testing.T) {
-	tools := ForSession(&mockClient{}, "test-sess")
-	resp, err := tools[1].Run(context.Background(), mockToolCall("write_file", `{"path":"/tmp/test.txt","content":"hi"}`))
+func TestWriteFile_Success(t *testing.T) {
+	tool := NewWriteFileTool(&mockClient{})
+	resp, err := tool.Run(testCtx(), mockToolCall(WriteName, `{"path":"/tmp/test.txt","content":"hi"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,9 +134,9 @@ func TestForSession_WriteFile_Success(t *testing.T) {
 	}
 }
 
-func TestForSession_WriteFile_Error(t *testing.T) {
-	tools := ForSession(&mockClient{writeErr: fmt.Errorf("permission denied")}, "test-sess")
-	resp, err := tools[1].Run(context.Background(), mockToolCall("write_file", `{"path":"/tmp/test.txt","content":"hi"}`))
+func TestWriteFile_Error(t *testing.T) {
+	tool := NewWriteFileTool(&mockClient{writeErr: fmt.Errorf("permission denied")})
+	resp, err := tool.Run(testCtx(), mockToolCall(WriteName, `{"path":"/tmp/test.txt","content":"hi"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,9 +145,9 @@ func TestForSession_WriteFile_Error(t *testing.T) {
 	}
 }
 
-func TestForSession_Execute_Success(t *testing.T) {
-	tools := ForSession(&mockClient{terminalOutput: "hello\n"}, "test-sess")
-	resp, err := tools[2].Run(context.Background(), mockToolCall("execute", `{"command":"echo","args":["hello"]}`))
+func TestExecute_Success(t *testing.T) {
+	tool := NewExecuteTool(&mockClient{terminalOutput: "hello\n"})
+	resp, err := tool.Run(testCtx(), mockToolCall(ExecuteName, `{"command":"echo","args":["hello"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,9 +156,9 @@ func TestForSession_Execute_Success(t *testing.T) {
 	}
 }
 
-func TestForSession_Execute_Error(t *testing.T) {
-	tools := ForSession(&mockClient{terminalErr: fmt.Errorf("denied")}, "test-sess")
-	resp, err := tools[2].Run(context.Background(), mockToolCall("execute", `{"command":"echo","args":["hi"]}`))
+func TestExecute_Error(t *testing.T) {
+	tool := NewExecuteTool(&mockClient{terminalErr: fmt.Errorf("denied")})
+	resp, err := tool.Run(testCtx(), mockToolCall(ExecuteName, `{"command":"echo","args":["hi"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,19 +167,55 @@ func TestForSession_Execute_Error(t *testing.T) {
 	}
 }
 
-func TestKind(t *testing.T) {
-	tests := []struct {
-		name string
-		want acp.ToolKind
-	}{
-		{"read_file", acp.ToolKindRead},
-		{"write_file", acp.ToolKindEdit},
-		{"execute", acp.ToolKindExecute},
-		{"unknown", acp.ToolKindOther},
+func TestPlan_EmitsInput(t *testing.T) {
+	client := &mockClient{}
+	tool := NewPlanTool(client)
+	input := `{"entries":[{"content":"step 1","priority":"high","status":"pending"},{"content":"step 2","priority":"medium","status":"in_progress"}]}`
+	resp, err := tool.Run(testCtx(), mockToolCall(PlanName, input))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		if got := Kind(tt.name); got != tt.want {
-			t.Errorf("Kind(%q) = %q, want %q", tt.name, got, tt.want)
-		}
+	if resp.IsError {
+		t.Fatal("expected success")
+	}
+	if len(client.updates) != 1 {
+		t.Fatalf("got %d updates, want 1", len(client.updates))
+	}
+	plan, ok := client.updates[0].Update.AsPlan()
+	if !ok {
+		t.Fatalf("update = %+v, want Plan", client.updates[0].Update)
+	}
+	if len(plan.Entries) != 2 {
+		t.Fatalf("plan has %d entries, want 2", len(plan.Entries))
+	}
+	if plan.Entries[0].Content != "step 1" || plan.Entries[0].Priority != acp.PlanEntryPriorityHigh {
+		t.Fatalf("entry 0 = %+v", plan.Entries[0])
+	}
+}
+
+func TestPlan_RendersChecklist(t *testing.T) {
+	tool := NewPlanTool(&mockClient{})
+	input := `{"entries":[{"content":"done task","priority":"high","status":"completed"},{"content":"todo task","priority":"low","status":"pending"}]}`
+	resp, err := tool.Run(testCtx(), mockToolCall(PlanName, input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "- [x] (high) done task\n- [ ] (low) todo task\n"
+	if resp.Content != want {
+		t.Fatalf("render =\n%q\nwant\n%q", resp.Content, want)
+	}
+}
+
+func TestPlan_EmitError(t *testing.T) {
+	client := &mockClient{sessionUpdate: func(*acp.SessionNotification) error {
+		return fmt.Errorf("send failed")
+	}}
+	tool := NewPlanTool(client)
+	resp, err := tool.Run(testCtx(), mockToolCall(PlanName, `{"entries":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.IsError {
+		t.Fatal("expected error response")
 	}
 }

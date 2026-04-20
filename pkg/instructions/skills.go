@@ -25,7 +25,7 @@ type Skill struct {
 }
 
 // discoverSkills finds skills in the given directory under cwd.
-func discoverSkills(cwd, skillsDir string, fs Filesystem) []Skill {
+func discoverSkills(cwd, skillsDir string, fs fs) []Skill {
 	if cwd == "" {
 		return nil
 	}

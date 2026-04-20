@@ -18,14 +18,6 @@ func (m *mockFS) ReadFile(path string) (string, error) {
 	return "", fmt.Errorf("not found")
 }
 
-func (m *mockFS) WriteFile(path, content string) error {
-	if m.files == nil {
-		m.files = make(map[string]string)
-	}
-	m.files[path] = content
-	return nil
-}
-
 func (m *mockFS) ListDir(dir string) []string {
 	return m.dirs[dir]
 }
@@ -66,8 +58,7 @@ func TestDiscover(t *testing.T) {
 			"/project/AGENTS.md": "# Rules",
 		},
 	}
-	i := New()
-	prompt := i.Discover("/project", fs)
+	prompt := New().discover("/project", fs)
 	if !strings.Contains(prompt, "# Rules") {
 		t.Fatal("expected context in prompt")
 	}
@@ -83,30 +74,28 @@ func TestDiscover_WithSkills(t *testing.T) {
 		},
 		dirs: map[string][]string{"/project/.agents/skills": {"my-skill"}},
 	}
-	i := New()
-	prompt := i.Discover("/project", fs)
+	prompt := New().discover("/project", fs)
 	if !strings.Contains(prompt, "my-skill") {
 		t.Fatal("expected skill in prompt")
 	}
 }
 
 func TestDiscover_EmptyCwd(t *testing.T) {
-	i := New()
-	prompt := i.Discover("", &mockFS{})
+	prompt := New().discover("", &mockFS{})
 	if prompt != DefaultPrompt {
 		t.Fatalf("expected base prompt only, got %q", prompt)
 	}
 }
 
 func TestSystemPrompt_BaseOnly(t *testing.T) {
-	prompt := systemPrompt("base prompt", "", nil, nil)
+	prompt := systemPrompt("base prompt", "", nil, nil, nil)
 	if prompt != "base prompt" {
 		t.Fatalf("expected base prompt, got %q", prompt)
 	}
 }
 
 func TestSystemPrompt_WithCwd(t *testing.T) {
-	prompt := systemPrompt("base", "/project", nil, nil)
+	prompt := systemPrompt("base", "/project", nil, nil, nil)
 	if !strings.Contains(prompt, "/project") {
 		t.Fatal("expected cwd in prompt")
 	}
@@ -114,7 +103,7 @@ func TestSystemPrompt_WithCwd(t *testing.T) {
 
 func TestSystemPrompt_WithContext(t *testing.T) {
 	ctx := []contextFile{{Path: "/project/AGENTS.md", Content: "# Rules\nUse Go."}}
-	prompt := systemPrompt("base", "/project", ctx, nil)
+	prompt := systemPrompt("base", "/project", ctx, nil, nil)
 	if !strings.Contains(prompt, "<context>") {
 		t.Fatal("expected context XML")
 	}
@@ -125,7 +114,7 @@ func TestSystemPrompt_WithContext(t *testing.T) {
 
 func TestSystemPrompt_WithSkills(t *testing.T) {
 	sk := []Skill{{Name: "test-skill", Description: "A test.", Location: "/project/.agents/skills/test-skill/SKILL.md"}}
-	prompt := systemPrompt("base", "/project", nil, sk)
+	prompt := systemPrompt("base", "/project", nil, sk, nil)
 	if !strings.Contains(prompt, "<available_skills>") {
 		t.Fatal("expected skills XML")
 	}

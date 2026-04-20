@@ -20,7 +20,7 @@ type contextFile struct {
 }
 
 // discoverContext checks cwd and cwd/.agents for context files.
-func discoverContext(cwd string, names []string, fs Filesystem) []contextFile {
+func discoverContext(cwd string, names []string, fs fs) []contextFile {
 	if cwd == "" {
 		return nil
 	}

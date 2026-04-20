@@ -5,6 +5,7 @@
 # Build artifacts
 bin/
 /beaver
+/bvr
 
 # Data / sessions
 .beaver/
@@ -19,6 +20,7 @@ bin/
 
 # Agent runtime
 .agents/
+.letta/
 
 # OS
 *.swp

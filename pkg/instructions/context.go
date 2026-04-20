@@ -2,23 +2,32 @@
 // and builds the system prompt. See https://agents.md and https://agentskills.io
 package instructions
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+
+	acp "github.com/ironpark/go-acp"
+)
 
 // DefaultPrompt is the default base system prompt.
 const DefaultPrompt = "You are a helpful coding assistant. Use the provided tools to read files, write files, and execute commands."
 
-// Filesystem provides file access for discovering context and skills.
-type Filesystem interface {
-	ReadFile(path string) (string, error)
-	WriteFile(path, content string) error
-	ListDir(dir string) []string
+// Section is a named block of content appended to the system prompt.
+// Extensions contribute sections to provide the LLM with additional context.
+type Section struct {
+	Content string
 }
+
+// SectionFunc returns a section to include in the system prompt.
+// Return an empty Content to skip.
+type SectionFunc func() Section
 
 // Instructions configures how to discover and build the system prompt.
 type Instructions struct {
 	basePrompt   string
 	contextFiles []string
 	skillsDirs   []string
+	sections     []SectionFunc
 }
 
 // Option configures an Instructions value.
@@ -53,20 +62,39 @@ func WithSkillsDirs(dirs ...string) Option {
 	return func(i *Instructions) { i.skillsDirs = dirs }
 }
 
-// Discover reads context files and skills from the filesystem,
-// then assembles and returns the complete system prompt.
-func (i *Instructions) Discover(cwd string, fs Filesystem) string {
+// WithSections adds dynamic section providers to the system prompt.
+func WithSections(fns ...SectionFunc) Option {
+	return func(i *Instructions) { i.sections = append(i.sections, fns...) }
+}
+
+// Discover reads context files and skills via the ACP client, then
+// assembles and returns the complete system prompt.
+func (i *Instructions) Discover(ctx context.Context, cwd string, client acp.Client, sid acp.SessionID) string {
+	return i.discover(cwd, &clientFS{ctx: ctx, client: client, sid: sid})
+}
+
+// discover is the internal entry point used by both Discover and tests.
+func (i *Instructions) discover(cwd string, fs fs) string {
 	context := discoverContext(cwd, i.contextFiles, fs)
 	var skills []Skill
 	for _, dir := range i.skillsDirs {
 		skills = append(skills, discoverSkills(cwd, dir, fs)...)
 	}
-	return systemPrompt(i.basePrompt, cwd, context, skills)
+
+	// Collect extension sections.
+	var sections []Section
+	for _, fn := range i.sections {
+		if s := fn(); s.Content != "" {
+			sections = append(sections, s)
+		}
+	}
+
+	return systemPrompt(i.basePrompt, cwd, context, skills, sections)
 }
 
 // systemPrompt builds a complete system prompt from the base prompt,
-// working directory, context files, and available skills.
-func systemPrompt(basePrompt, cwd string, context []contextFile, skills []Skill) string {
+// working directory, context files, available skills, and extension sections.
+func systemPrompt(basePrompt, cwd string, context []contextFile, skills []Skill, sections []Section) string {
 	prompt := basePrompt
 	if cwd != "" {
 		prompt += fmt.Sprintf(" The working directory is %s. Always use absolute paths when reading or writing files.", cwd)
@@ -76,6 +104,9 @@ func systemPrompt(basePrompt, cwd string, context []contextFile, skills []Skill)
 	}
 	if xml := skillsToXML(skills); xml != "" {
 		prompt += "\n\n" + xml + "\n\n" + skillsUsage
+	}
+	for _, s := range sections {
+		prompt += "\n\n" + s.Content
 	}
 	return prompt
 }
