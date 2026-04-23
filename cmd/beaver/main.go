@@ -39,30 +39,9 @@ func main() {
 	)
 
 	if *httpAddr != "" {
-		transport := acp.NewHTTPServerTransport()
-		conn := acp.NewAgentSideConnection(a, nil, nil, acp.WithTransport(transport))
-		a.SetClient(conn)
-		a.SetTools(
-			tools.NewReadFileTool(conn),
-			tools.NewWriteFileTool(conn),
-			tools.NewExecuteTool(conn),
-			tools.NewPlanTool(conn),
-		)
-		a.SetProviders(
-			extensions.BasePrompt(extensions.DefaultPrompt),
-			extensions.AgentsMd(conn),
-			extensions.Skills(conn),
-		)
-
-		go func() {
-			if err := conn.Start(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
-				os.Exit(1)
-			}
-		}()
-
+		bridge := agent.NewHTTPBridge(a)
 		fmt.Fprintf(os.Stderr, "beaver listening on %s\n", *httpAddr)
-		if err := http.ListenAndServe(*httpAddr, transport.Handler()); err != nil {
+		if err := http.ListenAndServe(*httpAddr, bridge.Handler()); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -80,7 +59,6 @@ func main() {
 			extensions.AgentsMd(conn),
 			extensions.Skills(conn),
 		)
-
 		if err := conn.Start(context.Background()); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
