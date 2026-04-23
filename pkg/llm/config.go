@@ -7,43 +7,13 @@ import (
 	"os"
 
 	"charm.land/fantasy"
-)
-
-// Variant is the API wire protocol type.
-type Variant string
-
-const (
-	VariantOpenAI       Variant = "openai"
-	VariantAnthropic    Variant = "anthropic"
-	VariantOpenAICompat Variant = "openaicompat"
-	VariantOpenRouter   Variant = "openrouter"
-	VariantGoogle       Variant = "google"
+	acp "github.com/ironpark/go-acp"
 )
 
 // Defaults holds default session configuration.
 type Defaults struct {
-	Model        string `json:"model,omitempty"`        // "provider/model"
+	Model        string `json:"model,omitempty"` // "provider/model"
 	ThoughtLevel string `json:"thoughtLevel,omitempty"`
-}
-
-// ModelOptions holds all call-time settings for a model.
-type ModelOptions struct {
-	ContextWindow   int64
-	MaxOutputTokens *int64
-	ProviderOptions fantasy.ProviderOptions
-}
-
-// ModelInfo describes an available model.
-type ModelInfo struct {
-	ID   string // "provider/model"
-	Name string
-}
-
-// ModelGroup holds models grouped by provider.
-type ModelGroup struct {
-	Provider string
-	Name     string
-	Models   []ModelInfo
 }
 
 // ModelRegistry resolves model IDs to language models and provides defaults.
@@ -52,28 +22,6 @@ type ModelRegistry interface {
 	ModelOptions(model, thoughtLevel string) ModelOptions
 	Defaults() Defaults
 	AvailableModelGroups() []ModelGroup
-}
-
-// ProviderConfig defines an API provider that hosts models.
-type ProviderConfig struct {
-	Name    string                 `json:"name,omitempty"`
-	Variant Variant                `json:"variant"`
-	API     string                 `json:"api,omitempty"` // base URL override (works for all variants)
-	Env     []string               `json:"env"`           // env var names for API key
-	Models  map[string]ModelConfig `json:"models"`
-}
-
-// ModelConfig defines a model available through a provider.
-type ModelConfig struct {
-	Name    string       `json:"name,omitempty"`
-	Variant *Variant     `json:"variant,omitempty"` // override provider variant
-	Limit   *ModelLimits `json:"limit,omitempty"`
-}
-
-// ModelLimits defines token limits for a model.
-type ModelLimits struct {
-	Context int64 `json:"context,omitempty"`
-	Output  int64 `json:"output,omitempty"`
 }
 
 // Registry is a model registry loaded from a config file.
@@ -104,25 +52,45 @@ func (r *Registry) Defaults() Defaults {
 	return r.defaults
 }
 
-// AvailableModelGroups returns models grouped by provider.
-func (r *Registry) AvailableModelGroups() []ModelGroup {
-	var groups []ModelGroup
-	for provID, prov := range r.Providers {
-		name := prov.Name
-		if name == "" {
-			name = provID
+// ConfigID identifies a session config option.
+type ConfigID = acp.SessionConfigID
+
+// Session config option IDs.
+const (
+	SessionConfigModel        ConfigID = "model"
+	SessionConfigThoughtLevel ConfigID = "thought_level"
+)
+
+// SessionOptions builds ACP session config options from the registry's
+// available models plus the caller's current model and thought-level
+// selections. Empty values fall back to registry defaults.
+func SessionOptions(registry ModelRegistry, currentModel, currentThoughtLevel string) []acp.SessionConfigOption {
+	var modelGroups []acp.SessionConfigSelectGroup
+	for _, g := range registry.AvailableModelGroups() {
+		var opts []acp.SessionConfigSelectOption
+		for _, m := range g.Models {
+			opts = append(opts, acp.SessionConfigSelectOption{
+				Value: acp.SessionConfigValueID(m.ID),
+				Name:  m.Name,
+			})
 		}
-		var models []ModelInfo
-		for modelID, mc := range prov.Models {
-			mname := mc.Name
-			if mname == "" {
-				mname = modelID
-			}
-			models = append(models, ModelInfo{ID: provID + "/" + modelID, Name: mname})
-		}
-		if len(models) > 0 {
-			groups = append(groups, ModelGroup{Provider: provID, Name: name, Models: models})
-		}
+		modelGroups = append(modelGroups, acp.SessionConfigSelectGroup{
+			Group:   acp.SessionConfigGroupID(g.Provider),
+			Name:    g.Name,
+			Options: opts,
+		})
 	}
-	return groups
+
+	if currentModel == "" {
+		currentModel = registry.Defaults().Model
+	}
+	if currentThoughtLevel == "" {
+		currentThoughtLevel = registry.Defaults().ThoughtLevel
+	}
+	return []acp.SessionConfigOption{
+		acp.NewSessionConfigOptionSelect(SessionConfigModel, "Model",
+			acp.SessionConfigValueID(currentModel), modelGroups),
+		acp.NewSessionConfigOptionSelect(SessionConfigThoughtLevel, "Thought Level",
+			acp.SessionConfigValueID(currentThoughtLevel), thoughtSelectOptions),
+	}
 }

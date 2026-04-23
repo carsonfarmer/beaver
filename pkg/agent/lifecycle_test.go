@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/google/uuid"
+	"github.com/carsonfarmer/beaver/pkg/storage"
 	acp "github.com/ironpark/go-acp"
 )
 
@@ -28,8 +28,8 @@ func TestNewSession(t *testing.T) {
 	if sess.Model != "test/model" {
 		t.Fatalf("expected default model %q, got %q", "test/model", sess.Model)
 	}
-	if _, err := a.store.Open(resp.SessionID); err != nil {
-		t.Fatal("expected log to exist")
+	if a.archive.Tip(resp.SessionID).IsZero() {
+		t.Fatal("expected session log to exist")
 	}
 }
 
@@ -127,10 +127,9 @@ func TestForkSession_AtEventID(t *testing.T) {
 		SessionID: id, Prompt: []acp.ContentBlock{acp.NewContentBlockText("second")},
 	})
 
-	srcLog, _ := a.store.Open(id)
-	events, _ := srcLog.Read(context.Background(), uuid.Nil)
+	events, _ := storage.Lineage(a.archive, a.archive.Tip(id))
 
-	var firstUserEvt uuid.UUID
+	var firstUserEvt storage.EventID
 	for _, ev := range events {
 		if ev.Update == nil {
 			continue
@@ -140,7 +139,7 @@ func TestForkSession_AtEventID(t *testing.T) {
 			break
 		}
 	}
-	if firstUserEvt == uuid.Nil {
+	if firstUserEvt.IsZero() {
 		t.Fatal("no user message event found")
 	}
 
@@ -153,8 +152,7 @@ func TestForkSession_AtEventID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	forkLog, _ := a.store.Open(resp.SessionID)
-	forkEvents, _ := forkLog.Read(context.Background(), uuid.Nil)
+	forkEvents, _ := storage.Lineage(a.archive, a.archive.Tip(resp.SessionID))
 	var srcPos int
 	for i, ev := range events {
 		if ev.ID == firstUserEvt {
@@ -162,7 +160,8 @@ func TestForkSession_AtEventID(t *testing.T) {
 			break
 		}
 	}
-	wantLen := 1 + srcPos
+	// Zero-copy fork: source events [0..srcPos] + fork header.
+	wantLen := srcPos + 2
 	if len(forkEvents) != wantLen {
 		t.Fatalf("fork has %d events, want %d", len(forkEvents), wantLen)
 	}
@@ -174,7 +173,7 @@ func TestForkSession_InvalidEventID(t *testing.T) {
 	id := createTestSession(t, a, "/tmp")
 	_, err := a.ForkSession(context.Background(), &acp.ForkSessionRequest{
 		SessionID: id,
-		Meta:      map[string]any{"fork_at_event_id": "not-a-uuid"},
+		Meta:      map[string]any{"fork_at_event_id": "not-a-valid-id"},
 	})
 	if err == nil {
 		t.Fatal("expected error on invalid event id")

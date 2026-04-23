@@ -4,44 +4,55 @@ import (
 	"context"
 	"sync"
 
-	"github.com/carsonfarmer/beaver/pkg/eventlog"
-	"github.com/carsonfarmer/beaver/pkg/instructions"
+	"charm.land/fantasy"
+	"github.com/carsonfarmer/beaver/pkg/extensions"
 	"github.com/carsonfarmer/beaver/pkg/llm"
 	"github.com/carsonfarmer/beaver/pkg/session"
-	"github.com/google/uuid"
+	"github.com/carsonfarmer/beaver/pkg/storage"
 
 	acp "github.com/ironpark/go-acp"
 )
 
 // Agent implements acp.Agent and the optional session lifecycle interfaces.
 type Agent struct {
-	registry     llm.ModelRegistry
-	store        eventlog.Store
-	client       acp.Client
-	instructions *instructions.Instructions
+	client    acp.Client
+	registry  llm.ModelRegistry
+	archive   storage.Archive
+	tools     []fantasy.AgentTool
+	providers []extensions.Provider
 
 	mu       sync.RWMutex
-	sessions map[acp.SessionID]*session.Session
+	sessions map[acp.SessionID]*session.State
 }
 
-// New creates a new Agent with the given dependencies.
-func New(registry llm.ModelRegistry, store eventlog.Store, insts *instructions.Instructions) *Agent {
-	return &Agent{
-		registry:     registry,
-		store:        store,
-		instructions: insts,
-		sessions:     make(map[acp.SessionID]*session.Session),
+// New creates a new Agent with the given options.
+func New(opts ...Option) *Agent {
+	a := &Agent{
+		sessions: make(map[acp.SessionID]*session.State),
 	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 // SetClient sets the ACP client for outbound calls and notifications.
+// This is required when the client cannot be provided at construction time
+// due to a circular dependency (e.g., the connection wraps the agent).
 func (a *Agent) SetClient(c acp.Client) { a.client = c }
+
+// SetTools registers the agent's tool set. Replaces any previously set tools.
+func (a *Agent) SetTools(tools ...fantasy.AgentTool) { a.tools = tools }
+
+// SetProviders registers context providers that contribute to the system prompt.
+// Replaces any previously set providers.
+func (a *Agent) SetProviders(providers ...extensions.Provider) { a.providers = providers }
 
 func (a *Agent) Initialize(_ context.Context, _ *acp.InitializeRequest) (*acp.InitializeResponse, error) {
 	return &acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersion(acp.CurrentProtocolVersion),
 		AgentCapabilities: &acp.AgentCapabilities{
-			LoadSession:     true,
+			LoadSession: true,
 			MCPCapabilities: &acp.MCPCapabilities{},
 			PromptCapabilities: &acp.PromptCapabilities{
 				Image:           true,
@@ -81,28 +92,28 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, req *acp.SetSessionC
 		sess.ThoughtLevel = string(req.Value)
 	}
 	opts := llm.SessionOptions(a.registry, sess.Model, sess.ThoughtLevel)
-	client := &eventlog.LoggingClient{Client: a.client, Store: a.store}
+	client := &LoggingClient{Client: a.client, Archive: a.archive}
 	acp.NewSessionStream(client, req.SessionID).SendConfigUpdate(ctx, opts)
 	return &acp.SetSessionConfigOptionResponse{ConfigOptions: opts}, nil
 }
 
-// --- cache and store helpers ---
+// --- cache and archive helpers ---
 
-func (a *Agent) cachedSession(id acp.SessionID) (*session.Session, bool) {
+func (a *Agent) cachedSession(id acp.SessionID) (*session.State, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	s, ok := a.sessions[id]
 	return s, ok
 }
 
-func (a *Agent) loadedSession(id acp.SessionID) (*session.Session, error) {
+func (a *Agent) loadedSession(id acp.SessionID) (*session.State, error) {
 	if s, ok := a.cachedSession(id); ok {
 		return s, nil
 	}
 	return a.loadState(id)
 }
 
-func (a *Agent) setSession(id acp.SessionID, s *session.Session) {
+func (a *Agent) setSession(id acp.SessionID, s *session.State) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sessions[id] = s
@@ -114,26 +125,30 @@ func (a *Agent) deleteSession(id acp.SessionID) {
 	delete(a.sessions, id)
 }
 
-func (a *Agent) loadState(id acp.SessionID) (*session.Session, error) {
-	log, err := a.store.Open(id)
+// loadState rebuilds the session's runtime state by walking its lineage
+// and folding events through the projection.
+func (a *Agent) loadState(id acp.SessionID) (*session.State, error) {
+	tip := a.archive.Tip(id)
+	if tip.IsZero() {
+		return nil, errSessionNotFound
+	}
+	events, err := storage.Lineage(a.archive, tip)
 	if err != nil {
 		return nil, err
 	}
-	events, err := log.Read(context.Background(), uuid.Nil)
-	if err != nil {
-		return nil, err
-	}
-	sess := eventlog.Reduce(events)
-	a.setSession(id, sess)
-	return sess, nil
+	state := session.Project(events)
+	a.setSession(id, state)
+	return state, nil
 }
 
+// replayEvents streams the session's full lineage back to the client, used
+// on LoadSession so the client can rebuild its UI.
 func (a *Agent) replayEvents(ctx context.Context, sid acp.SessionID) {
-	log, err := a.store.Open(sid)
-	if err != nil {
+	tip := a.archive.Tip(sid)
+	if tip.IsZero() {
 		return
 	}
-	events, err := log.Read(ctx, uuid.Nil)
+	events, err := storage.Lineage(a.archive, tip)
 	if err != nil {
 		return
 	}

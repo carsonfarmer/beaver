@@ -1,4 +1,4 @@
-package instructions
+package extensions
 
 import (
 	"strings"
@@ -55,28 +55,6 @@ func TestParseFrontmatter_WindowsLineEndings(t *testing.T) {
 	}
 	if s.Name != "test-skill" {
 		t.Fatalf("expected name %q, got %q", "test-skill", s.Name)
-	}
-}
-
-func TestDiscoverSkills(t *testing.T) {
-	fs := &mockFS{
-		dirs: map[string][]string{"/project/.agents/skills": {"my-skill"}},
-		files: map[string]string{
-			"/project/.agents/skills/my-skill/SKILL.md": "---\nname: my-skill\ndescription: Does stuff.\n---\nBody.",
-		},
-	}
-	found := discoverSkills("/project", DefaultSkillsDir, fs)
-	if len(found) != 1 {
-		t.Fatalf("expected 1 skill, got %d", len(found))
-	}
-	if found[0].Name != "my-skill" {
-		t.Fatalf("expected name %q, got %q", "my-skill", found[0].Name)
-	}
-}
-
-func TestDiscoverSkills_EmptyCwd(t *testing.T) {
-	if len(discoverSkills("", DefaultSkillsDir, nil)) != 0 {
-		t.Fatal("expected no skills for empty cwd")
 	}
 }
 

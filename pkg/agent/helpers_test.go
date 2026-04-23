@@ -6,10 +6,9 @@ import (
 	"testing"
 
 	"charm.land/fantasy"
-	"github.com/carsonfarmer/beaver/pkg/eventlog"
-	"github.com/carsonfarmer/beaver/pkg/instructions"
 	"github.com/carsonfarmer/beaver/pkg/llm"
 	"github.com/carsonfarmer/beaver/pkg/session"
+	"github.com/carsonfarmer/beaver/pkg/storage"
 	acp "github.com/ironpark/go-acp"
 )
 
@@ -119,14 +118,20 @@ func newTestRegistry() *mockRegistry {
 
 func newTestAgent(t *testing.T) *Agent {
 	t.Helper()
-	return New(newTestRegistry(), eventlog.NewMemStore(), instructions.New())
+	return New(
+		WithRegistry(newTestRegistry()),
+		WithStorage(storage.NewMemArchive()),
+	)
 }
 
 func newTestAgentWithModel(t *testing.T) *Agent {
 	t.Helper()
 	reg := newTestRegistry()
 	reg.model = &mockLanguageModel{text: "Hello from mock!"}
-	a := New(reg, eventlog.NewMemStore(), instructions.New())
+	a := New(
+		WithRegistry(reg),
+		WithStorage(storage.NewMemArchive()),
+	)
 	a.SetClient(&mockClient{})
 	return a
 }
@@ -142,10 +147,9 @@ func createTestSession(t *testing.T, a *Agent, cwd string) acp.SessionID {
 }
 
 // setupSession creates a log and caches a session with the given fields.
-func setupSession(t *testing.T, a *Agent, id acp.SessionID, sess *session.Session) {
+func setupSession(t *testing.T, a *Agent, id acp.SessionID, sess *session.State) {
 	t.Helper()
-	_, err := a.store.Create(id, acp.SessionInfo{SessionID: id, Cwd: sess.Cwd})
-	if err != nil {
+	if err := a.archive.Create(id, storage.EventID{}, acp.SessionInfo{SessionID: id, Cwd: sess.Cwd}); err != nil {
 		t.Fatal(err)
 	}
 	a.setSession(id, sess)

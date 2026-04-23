@@ -5,11 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/carsonfarmer/beaver/pkg/eventlog"
-	"github.com/carsonfarmer/beaver/pkg/instructions"
+	"github.com/carsonfarmer/beaver/pkg/extensions"
 	"github.com/carsonfarmer/beaver/pkg/llm"
 	"github.com/carsonfarmer/beaver/pkg/session"
-	"github.com/google/uuid"
+	"github.com/carsonfarmer/beaver/pkg/storage"
 	acp "github.com/ironpark/go-acp"
 )
 
@@ -27,7 +26,7 @@ func TestCancel_CancelsActivePrompt(t *testing.T) {
 	defer cancel()
 
 	id := acp.SessionID("sess")
-	setupSession(t, a, id, &session.Session{Cancel: cancel})
+	setupSession(t, a, id, &session.State{Cancel: cancel})
 	a.Cancel(context.Background(), &acp.CancelNotification{SessionID: id})
 	if ctx.Err() == nil {
 		t.Fatal("expected context to be cancelled")
@@ -46,7 +45,7 @@ func TestPrompt_NoModel(t *testing.T) {
 	a := newTestAgent(t)
 	a.SetClient(&mockClient{})
 	id := acp.SessionID("sess")
-	setupSession(t, a, id, &session.Session{Model: ""})
+	setupSession(t, a, id, &session.State{Model: ""})
 	_, err := a.Prompt(context.Background(), &acp.PromptRequest{SessionID: id})
 	if err == nil {
 		t.Fatal("expected error for empty model")
@@ -57,7 +56,7 @@ func TestPrompt_ModelResolveError(t *testing.T) {
 	a := newTestAgent(t)
 	a.SetClient(&mockClient{})
 	id := acp.SessionID("sess")
-	setupSession(t, a, id, &session.Session{Model: "nonexistent/model"})
+	setupSession(t, a, id, &session.State{Model: "nonexistent/model"})
 	_, err := a.Prompt(context.Background(), &acp.PromptRequest{SessionID: id})
 	if err == nil {
 		t.Fatal("expected error for unresolvable model")
@@ -113,11 +112,11 @@ func TestPrompt_SendsUsageUpdate(t *testing.T) {
 		defaults: llm.Defaults{Model: "mock/model"},
 		opts:     llm.ModelOptions{ContextWindow: 128000},
 	}
-	a := New(reg, eventlog.NewMemStore(), instructions.New())
+	a := New(WithRegistry(reg), WithStorage(storage.NewMemArchive()))
 	mc := &mockClient{}
 	a.SetClient(mc)
 	id := acp.SessionID("sess")
-	setupSession(t, a, id, &session.Session{Model: "mock/model"})
+	setupSession(t, a, id, &session.State{Model: "mock/model"})
 
 	a.Prompt(context.Background(), &acp.PromptRequest{
 		SessionID: id,
@@ -128,42 +127,52 @@ func TestPrompt_SendsUsageUpdate(t *testing.T) {
 	}
 }
 
-func TestPrompt_DiscoversContextLazily(t *testing.T) {
+func TestNewSession_DiscoversContext(t *testing.T) {
 	reg := newTestRegistry()
 	reg.model = &mockLanguageModel{text: "ok"}
-	a := New(reg, eventlog.NewMemStore(), instructions.New())
-	a.SetClient(&mockClient{
+	mc := &mockClient{
 		files: map[string]string{"/project/AGENTS.md": "# Rules"},
-	})
-	resp, _ := a.NewSession(context.Background(), &acp.NewSessionRequest{Cwd: "/project"})
-	a.Prompt(context.Background(), &acp.PromptRequest{
-		SessionID: resp.SessionID,
-		Prompt:    []acp.ContentBlock{acp.NewContentBlockText("hi")},
-	})
+	}
+	a := New(WithRegistry(reg), WithStorage(storage.NewMemArchive()))
+	a.SetClient(mc)
+	a.SetProviders(
+		extensions.BasePrompt(extensions.DefaultPrompt),
+		extensions.AgentsMd(mc),
+	)
+
+	resp, err := a.NewSession(context.Background(), &acp.NewSessionRequest{Cwd: "/project"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sess, _ := a.cachedSession(resp.SessionID)
 	if !strings.Contains(sess.SystemPrompt, "# Rules") {
-		t.Fatal("expected context in system prompt after first prompt")
+		t.Fatal("expected context in system prompt after session creation")
 	}
 }
 
-func TestPrompt_DiscoversSkillsLazily(t *testing.T) {
+func TestNewSession_DiscoversSkills(t *testing.T) {
 	reg := newTestRegistry()
 	reg.model = &mockLanguageModel{text: "ok"}
-	a := New(reg, eventlog.NewMemStore(), instructions.New())
-	a.SetClient(&mockClient{
+	mc := &mockClient{
 		termOut: "my-skill\n",
 		files: map[string]string{
 			"/project/.agents/skills/my-skill/SKILL.md": "---\nname: my-skill\ndescription: Does things.\n---\nBody.",
 		},
-	})
-	resp, _ := a.NewSession(context.Background(), &acp.NewSessionRequest{Cwd: "/project"})
-	a.Prompt(context.Background(), &acp.PromptRequest{
-		SessionID: resp.SessionID,
-		Prompt:    []acp.ContentBlock{acp.NewContentBlockText("hi")},
-	})
+	}
+	a := New(WithRegistry(reg), WithStorage(storage.NewMemArchive()))
+	a.SetClient(mc)
+	a.SetProviders(
+		extensions.BasePrompt(extensions.DefaultPrompt),
+		extensions.Skills(mc),
+	)
+
+	resp, err := a.NewSession(context.Background(), &acp.NewSessionRequest{Cwd: "/project"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sess, _ := a.cachedSession(resp.SessionID)
 	if !strings.Contains(sess.SystemPrompt, "my-skill") {
-		t.Fatal("expected skill in system prompt after first prompt")
+		t.Fatal("expected skill in system prompt after session creation")
 	}
 }
 
@@ -191,10 +200,9 @@ func TestPrompt_RewindToParentMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log, _ := a.store.Open(id)
-	events, _ := log.Read(context.Background(), uuid.Nil)
+	events, _ := storage.Lineage(a.archive, a.archive.Tip(id))
 
-	var firstEvt uuid.UUID
+	var firstEvt storage.EventID
 	for _, ev := range events {
 		if ev.Update == nil {
 			continue
@@ -204,7 +212,7 @@ func TestPrompt_RewindToParentMessage(t *testing.T) {
 			break
 		}
 	}
-	if firstEvt == uuid.Nil {
+	if firstEvt.IsZero() {
 		t.Fatal("first message event not found")
 	}
 
@@ -214,7 +222,7 @@ func TestPrompt_RewindToParentMessage(t *testing.T) {
 			continue
 		}
 		if c, ok := ev.Update.AsUserMessageChunk(); ok && c.MessageID != resp1.UserMessageID {
-			if ev.ParentID == firstEvt {
+			if ev.Parent == firstEvt {
 				found = true
 				break
 			}

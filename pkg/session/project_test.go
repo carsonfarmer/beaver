@@ -1,4 +1,4 @@
-package eventlog
+package session
 
 import (
 	"encoding/json"
@@ -6,31 +6,35 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/beaver/pkg/llm"
-	"github.com/google/uuid"
+	"github.com/carsonfarmer/beaver/pkg/storage"
 	acp "github.com/ironpark/go-acp"
 )
 
-func event(update acp.SessionUpdate) Event {
-	return Event{ID: uuid.Must(uuid.NewV7()), Update: &update}
+var testSeq int64
+
+func event(update acp.SessionUpdate) storage.Event {
+	testSeq++
+	return storage.Event{ID: storage.EventID{Session: "test", N: testSeq}, Update: &update}
 }
 
-func primer(id acp.SessionID, cwd string, extra map[string]any) Event {
-	return Event{
-		ID:   uuid.Must(uuid.NewV7()),
+func primer(id acp.SessionID, cwd string, extra map[string]any) storage.Event {
+	testSeq++
+	return storage.Event{
+		ID:   storage.EventID{Session: id, N: testSeq},
 		Info: &acp.SessionInfo{SessionID: id, Cwd: cwd, Meta: extra},
 	}
 }
 
-func TestReduce_PrimerSeedsCwd(t *testing.T) {
-	events := []Event{primer("s1", "/home/user/project", nil)}
-	state := Reduce(events)
+func TestProject_PrimerSeedsCwd(t *testing.T) {
+	events := []storage.Event{primer("s1", "/home/user/project", nil)}
+	state := Project(events)
 	if state.Cwd != "/home/user/project" {
 		t.Fatalf("Cwd = %q, want %q", state.Cwd, "/home/user/project")
 	}
 }
 
-func TestReduce_ConfigOptionUpdate(t *testing.T) {
-	events := []Event{
+func TestProject_ConfigOptionUpdate(t *testing.T) {
+	events := []storage.Event{
 		primer("s1", "/tmp", nil),
 		event(acp.NewSessionUpdateConfigOptionUpdate([]acp.SessionConfigOption{
 			acp.NewSessionConfigOptionSelect("model", "Model", "anthropic/claude-4", nil),
@@ -41,7 +45,7 @@ func TestReduce_ConfigOptionUpdate(t *testing.T) {
 		})),
 	}
 
-	state := Reduce(events)
+	state := Project(events)
 	if state.Model != "openai/gpt-5" {
 		t.Fatalf("Model = %q, want %q", state.Model, "openai/gpt-5")
 	}
@@ -50,13 +54,13 @@ func TestReduce_ConfigOptionUpdate(t *testing.T) {
 	}
 }
 
-func TestReduce_TextMessages(t *testing.T) {
-	events := []Event{
+func TestProject_TextMessages(t *testing.T) {
+	events := []storage.Event{
 		event(acp.NewSessionUpdateUserMessageChunk(acp.NewContentBlockText("hello world"), "u1")),
 		event(acp.NewSessionUpdateAgentMessageChunk(acp.NewContentBlockText("hi there"), "a1")),
 	}
 
-	state := Reduce(events)
+	state := Project(events)
 	if len(state.History) != 2 {
 		t.Fatalf("History len = %d, want 2", len(state.History))
 	}
@@ -78,13 +82,13 @@ func TestReduce_TextMessages(t *testing.T) {
 	}
 }
 
-func TestReduce_ThoughtChunks(t *testing.T) {
-	events := []Event{
+func TestProject_ThoughtChunks(t *testing.T) {
+	events := []storage.Event{
 		event(acp.NewSessionUpdateAgentThoughtChunk(acp.NewContentBlockText("thinking..."), "a1")),
 		event(acp.NewSessionUpdateAgentMessageChunk(acp.NewContentBlockText("answer"), "a1")),
 	}
 
-	state := Reduce(events)
+	state := Project(events)
 	if len(state.History) != 1 {
 		t.Fatalf("History len = %d, want 1", len(state.History))
 	}
@@ -103,12 +107,12 @@ func TestReduce_ThoughtChunks(t *testing.T) {
 	}
 }
 
-func TestReduce_ToolCallAndResult(t *testing.T) {
+func TestProject_ToolCallAndResult(t *testing.T) {
 	kind := acp.ToolKindRead
 	inProgress := acp.ToolCallStatusInProgress
 	completedStatus := acp.ToolCallStatusCompleted
 
-	events := []Event{
+	events := []storage.Event{
 		event(acp.NewSessionUpdateUserMessageChunk(acp.NewContentBlockText("read foo.go"), "u1")),
 		event(acp.NewSessionUpdateAgentMessageChunk(acp.NewContentBlockText("Let me read that."), "a1")),
 		event(acp.NewSessionUpdateToolCall(acp.ToolCall{
@@ -126,7 +130,7 @@ func TestReduce_ToolCallAndResult(t *testing.T) {
 		event(acp.NewSessionUpdateAgentMessageChunk(acp.NewContentBlockText("Here's the content."), "a2")),
 	}
 
-	state := Reduce(events)
+	state := Project(events)
 	if len(state.History) != 4 {
 		t.Fatalf("History len = %d, want 4", len(state.History))
 	}
@@ -174,24 +178,24 @@ func TestReduce_ToolCallAndResult(t *testing.T) {
 	}
 }
 
-func TestReduce_UsageUpdate(t *testing.T) {
-	events := []Event{
+func TestProject_UsageUpdate(t *testing.T) {
+	events := []storage.Event{
 		event(acp.NewSessionUpdateUsageUpdate(acp.UsageUpdate{Used: 500, Size: 200000})),
 		event(acp.NewSessionUpdateUsageUpdate(acp.UsageUpdate{Used: 1200, Size: 200000})),
 	}
 
-	state := Reduce(events)
+	state := Project(events)
 	if state.UsageUsed != 1200 || state.UsageSize != 200000 {
 		t.Fatalf("Usage = (%d, %d)", state.UsageUsed, state.UsageSize)
 	}
 }
 
-func TestReduce_SessionInfo(t *testing.T) {
-	events := []Event{
+func TestProject_SessionInfo(t *testing.T) {
+	events := []storage.Event{
 		event(acp.NewSessionUpdateSessionInfoUpdate("My Chat", "2026-04-09T12:00:00Z")),
 	}
 
-	state := Reduce(events)
+	state := Project(events)
 	if state.Title != "My Chat" {
 		t.Fatalf("Title = %q", state.Title)
 	}
@@ -200,12 +204,12 @@ func TestReduce_SessionInfo(t *testing.T) {
 	}
 }
 
-func TestReduce_MultiTurnConversation(t *testing.T) {
+func TestProject_MultiTurnConversation(t *testing.T) {
 	kind := acp.ToolKindEdit
 	inProgress := acp.ToolCallStatusInProgress
 	completed := acp.ToolCallStatusCompleted
 
-	events := []Event{
+	events := []storage.Event{
 		primer("s1", "/project", nil),
 		event(acp.NewSessionUpdateUserMessageChunk(acp.NewContentBlockText("write hello.txt"), "u1")),
 		event(acp.NewSessionUpdateAgentThoughtChunk(acp.NewContentBlockText("I'll create the file"), "a1")),
@@ -224,7 +228,7 @@ func TestReduce_MultiTurnConversation(t *testing.T) {
 		event(acp.NewSessionUpdateAgentMessageChunk(acp.NewContentBlockText("I wrote 'hello' to hello.txt"), "a3")),
 	}
 
-	state := Reduce(events)
+	state := Project(events)
 
 	if state.Cwd != "/project" {
 		t.Fatalf("Cwd = %q, want /project", state.Cwd)

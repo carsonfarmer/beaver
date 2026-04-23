@@ -1,19 +1,21 @@
-package eventlog
+package agent
 
 import (
 	"context"
 
+	"github.com/carsonfarmer/beaver/pkg/storage"
+
 	acp "github.com/ironpark/go-acp"
 )
 
-// LoggingClient wraps an acp.Client and appends every SessionUpdate to the
-// session's event log before forwarding to the underlying client.
-//
-// Delta chunk variants (AgentMessageChunk, AgentThoughtChunk) are skipped;
-// callers persist the coalesced content explicitly on stream end.
+// LoggingClient wraps an acp.Client so every outbound SessionUpdate is also
+// appended to the session's durable log before forwarding to the underlying
+// client. Streaming delta variants (AgentMessageChunk, AgentThoughtChunk)
+// are skipped — callers persist the coalesced content explicitly on stream
+// end to keep the log at full-unit granularity.
 type LoggingClient struct {
 	acp.Client
-	Store Store
+	Archive storage.Archive
 }
 
 func (c *LoggingClient) SessionUpdate(ctx context.Context, n *acp.SessionNotification) error {
@@ -21,9 +23,7 @@ func (c *LoggingClient) SessionUpdate(ctx context.Context, n *acp.SessionNotific
 		AgentMessageChunk: func(acp.SessionUpdateAgentMessageChunk) any { return nil },
 		AgentThoughtChunk: func(acp.SessionUpdateAgentThoughtChunk) any { return nil },
 		Default: func() any {
-			if log, err := c.Store.Open(n.SessionID); err == nil {
-				log.Append(ctx, n.Update)
-			}
+			c.Archive.Append(n.SessionID, storage.EventID{}, n.Update)
 			return nil
 		},
 	})

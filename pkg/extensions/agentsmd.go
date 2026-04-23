@@ -1,9 +1,12 @@
-package instructions
+package extensions
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	acp "github.com/ironpark/go-acp"
 )
 
 // DefaultContextFiles are the file names searched for in cwd and cwd/.agents.
@@ -19,8 +22,19 @@ type contextFile struct {
 	Content string
 }
 
-// discoverContext checks cwd and cwd/.agents for context files.
-func discoverContext(cwd string, names []string, fs fs) []contextFile {
+// AgentsMd returns a provider that discovers AGENTS.md files and contributes
+// their contents as a <context> section.
+func AgentsMd(client acp.Client, names ...string) Provider {
+	if len(names) == 0 {
+		names = DefaultContextFiles
+	}
+	return func(ctx context.Context, cwd string, sid acp.SessionID) (string, error) {
+		files := discoverContext(ctx, cwd, names, client, sid)
+		return contextToXML(files), nil
+	}
+}
+
+func discoverContext(ctx context.Context, cwd string, names []string, client acp.Client, sid acp.SessionID) []contextFile {
 	if cwd == "" {
 		return nil
 	}
@@ -28,11 +42,14 @@ func discoverContext(cwd string, names []string, fs fs) []contextFile {
 	for _, dir := range []string{cwd, filepath.Join(cwd, ".agents")} {
 		for _, name := range names {
 			path := filepath.Join(dir, name)
-			content, err := fs.ReadFile(path)
-			if err != nil || content == "" {
+			resp, err := client.ReadTextFile(ctx, &acp.ReadTextFileRequest{
+				Path:      path,
+				SessionID: sid,
+			})
+			if err != nil || resp.Content == "" {
 				continue
 			}
-			files = append(files, contextFile{Path: path, Content: content})
+			files = append(files, contextFile{Path: path, Content: resp.Content})
 			break // only one variant per directory
 		}
 	}

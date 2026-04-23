@@ -10,6 +10,13 @@ import (
 	"charm.land/fantasy/providers/openrouter"
 )
 
+// ModelOptions holds all call-time settings for a model.
+type ModelOptions struct {
+	ContextWindow   int64
+	MaxOutputTokens *int64
+	ProviderOptions fantasy.ProviderOptions
+}
+
 // ModelOptions returns call-time settings for the given model and thought level.
 func (r *Registry) ModelOptions(model, thoughtLevel string) ModelOptions {
 	prov, mc, ok := r.lookup(model)

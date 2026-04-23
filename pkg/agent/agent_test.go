@@ -92,7 +92,7 @@ func TestSetSessionConfigOption_UnknownConfigID(t *testing.T) {
 	a := newTestAgent(t)
 	a.SetClient(&mockClient{})
 	id := acp.SessionID("test-sess")
-	setupSession(t, a, id, &session.Session{Model: "openai/gpt-4.1"})
+	setupSession(t, a, id, &session.State{Model: "openai/gpt-4.1"})
 
 	_, err := a.SetSessionConfigOption(context.Background(), &acp.SetSessionConfigOptionRequest{
 		SessionID: id, ConfigID: "unknown", Value: "whatever",

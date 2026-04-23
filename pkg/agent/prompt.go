@@ -6,10 +6,9 @@ import (
 	"strings"
 
 	"charm.land/fantasy"
-	"github.com/carsonfarmer/beaver/pkg/eventlog"
 	"github.com/carsonfarmer/beaver/pkg/llm"
+	"github.com/carsonfarmer/beaver/pkg/storage"
 	"github.com/carsonfarmer/beaver/pkg/tools"
-	"github.com/google/uuid"
 
 	acp "github.com/ironpark/go-acp"
 )
@@ -46,32 +45,12 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest) (*acp.Prompt
 	}
 	opts := a.registry.ModelOptions(sess.Model, string(sess.ThoughtLevel))
 
-	if sess.SystemPrompt == "" {
-		sess.SystemPrompt = a.instructions.Discover(ctx, sess.Cwd, a.client, req.SessionID)
-	}
-
-	log, err := a.store.Open(req.SessionID)
-	if err != nil {
-		return nil, acp.ErrInternalError(nil, err.Error())
-	}
-
-	userMsgID := req.MessageID
-	if userMsgID == "" {
-		userMsgID = uuid.New().String()
-	}
-
-	// Optional rewind: parent_message_id identifies a prior message to
-	// branch from. Translate message_id → event_id (linear scan) so the
-	// first event of this turn links to the rewind target, not the tip.
-	var rewindParent uuid.UUID
+	// Optional rewind: parent_message_id parses directly to an EventID.
+	var rewindParent storage.EventID
 	if s, ok := req.Meta["parent_message_id"].(string); ok && s != "" {
-		events, err := log.Read(ctx, uuid.Nil)
+		p, err := storage.ParseEventID(s)
 		if err != nil {
-			return nil, acp.ErrInternalError(nil, err.Error())
-		}
-		p, ok := eventlog.FindByMessageID(events, s)
-		if !ok {
-			return nil, acp.ErrInvalidParams(nil, "parent_message_id not found")
+			return nil, acp.ErrInvalidParams(nil, err.Error())
 		}
 		rewindParent = p
 	}
@@ -79,69 +58,78 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest) (*acp.Prompt
 	ctx = tools.WithSessionID(ctx, req.SessionID)
 	ctx = tools.WithCwd(ctx, sess.Cwd)
 
-	client := &eventlog.LoggingClient{Client: a.client, Store: a.store}
+	client := &LoggingClient{Client: a.client, Archive: a.archive}
 	stream := acp.NewSessionStream(client, req.SessionID)
+
+	var userMsgID string
 	if msg, ok := llm.ContentBlocksToMessage(req.Prompt); ok {
 		sess.History = append(sess.History, msg)
 		if sess.Title == "" {
 			sess.Title = titleFromMessage(msg)
 		}
-		// Log user message directly. Stamp rewind target on the first
-		// chunk only; subsequent chunks chain off it via lastID.
 		for _, part := range msg.Content {
 			tp, ok := part.(fantasy.TextPart)
 			if !ok {
 				continue
 			}
+			nextID := storage.EventID{Session: req.SessionID, N: a.archive.Tip(req.SessionID).N + 1}
 			upd := acp.NewSessionUpdateUserMessageChunk(
-				acp.NewContentBlockText(tp.Text), userMsgID)
-			if rewindParent != uuid.Nil {
-				upd = eventlog.WithParentEventID(upd, rewindParent)
-				rewindParent = uuid.Nil
-			}
-			log.Append(ctx, upd)
+				acp.NewContentBlockText(tp.Text), nextID.String())
+			id, _ := a.archive.Append(req.SessionID, rewindParent, upd)
+			rewindParent = storage.EventID{}
+			userMsgID = id.String()
 		}
 	}
 
-	allTools := []fantasy.AgentTool{
-		tools.NewReadFileTool(client),
-		tools.NewWriteFileTool(client),
-		tools.NewExecuteTool(client),
-		tools.NewPlanTool(client),
-	}
-
 	fa := fantasy.NewAgent(model,
-		fantasy.WithTools(allTools...),
+		fantasy.WithTools(a.tools...),
 		fantasy.WithSystemPrompt(sess.SystemPrompt),
 	)
 
-	// Buffer text deltas per fantasy content-part ID; coalesced on OnTextEnd.
-	textBufs := map[string]*strings.Builder{}
+	// Per-part state: buffer deltas + the EventID we predicted at Start,
+	// used for both streaming correlation and final append.
+	type partState struct {
+		buf *strings.Builder
+		id  string
+	}
+	parts := map[string]*partState{}
+	predictID := func() string {
+		return storage.EventID{Session: req.SessionID, N: a.archive.Tip(req.SessionID).N + 1}.String()
+	}
 
 	result, err := fa.Stream(ctx, fantasy.AgentStreamCall{
 		Messages:        sess.History,
 		MaxOutputTokens: opts.MaxOutputTokens,
 		ProviderOptions: opts.ProviderOptions,
-		OnTextStart: func(id string) error {
-			textBufs[id] = &strings.Builder{}
+		OnTextStart: func(fid string) error {
+			parts[fid] = &partState{buf: &strings.Builder{}, id: predictID()}
 			return nil
 		},
-		OnTextDelta: func(id, delta string) error {
-			textBufs[id].WriteString(delta)
-			return stream.SendText(ctx, delta, acp.WithMessageID(id))
+		OnTextDelta: func(fid, delta string) error {
+			p := parts[fid]
+			p.buf.WriteString(delta)
+			return stream.SendText(ctx, delta, acp.WithMessageID(p.id))
 		},
-		OnTextEnd: func(id string) error {
-			buf := textBufs[id]
-			delete(textBufs, id)
-			return log.Append(ctx, acp.NewSessionUpdateAgentMessageChunk(
-				acp.NewContentBlockText(buf.String()), id))
+		OnTextEnd: func(fid string) error {
+			p := parts[fid]
+			delete(parts, fid)
+			_, err := a.archive.Append(req.SessionID, storage.EventID{}, acp.NewSessionUpdateAgentMessageChunk(
+				acp.NewContentBlockText(p.buf.String()), p.id))
+			return err
 		},
-		OnReasoningDelta: func(id, delta string) error {
-			return stream.SendThought(ctx, delta, acp.WithMessageID(id))
+		OnReasoningStart: func(fid string, _ fantasy.ReasoningContent) error {
+			parts[fid] = &partState{id: predictID()}
+			return nil
 		},
-		OnReasoningEnd: func(id string, r fantasy.ReasoningContent) error {
-			return log.Append(ctx, acp.NewSessionUpdateAgentThoughtChunk(
-				acp.NewContentBlockText(r.Text), id))
+		OnReasoningDelta: func(fid, delta string) error {
+			return stream.SendThought(ctx, delta, acp.WithMessageID(parts[fid].id))
+		},
+		OnReasoningEnd: func(fid string, r fantasy.ReasoningContent) error {
+			p := parts[fid]
+			delete(parts, fid)
+			_, err := a.archive.Append(req.SessionID, storage.EventID{}, acp.NewSessionUpdateAgentThoughtChunk(
+				acp.NewContentBlockText(r.Text), p.id))
+			return err
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
 			kind := tools.ToolKinds[tc.ToolName]

@@ -9,10 +9,13 @@ over stdio or HTTP. The goal is simplicity — the least code that does the job 
 ## Design Principles
 
 - **Simple over clever.** Don't add abstractions for "future flexibility."
-- **Append-only event log.** Session state is derived by replaying ACP
-  `SessionUpdate` events through a reducer. No full-session serialization.
-- **Events ARE ACP.** The log stores `acp.SessionUpdate` values directly — no
-  custom event types.
+- **Append-only event chain.** Session state is derived by replaying ACP
+  `SessionUpdate` events through a projection. No full-session serialization.
+- **Events ARE ACP.** The archive stores `acp.SessionUpdate` values directly —
+  no custom event types.
+- **Parent pointers, not file order.** Replay follows event parents, which can
+  cross sessions. Forks and rewinds are ordinary parent-choice consequences,
+  not special cases.
 - **Agent owns session lifecycle.** The Agent implements SessionCreator,
   SessionLoader, SessionLister, SessionForker, and SessionResumer directly.
 - **Config-driven multi-provider.** Models specified as `"provider/model"`.
@@ -27,10 +30,10 @@ over stdio or HTTP. The goal is simplicity — the least code that does the job 
 ```
 cmd/beaver/          — main() wiring, stdio/HTTP connection setup
 cmd/bvr/             — standalone CLI client (stdio spawn or HTTP)
-pkg/agent/           — ACP agent (agent.go: core + misc handlers; lifecycle.go: session lifecycle; prompt.go: Prompt + Cancel)
-pkg/eventlog/        — append-only event log (EventLog/Store interfaces, JSONL + mem impls, reducer, LoggingClient)
+pkg/agent/           — ACP agent (agent.go: core + misc handlers; lifecycle.go: session lifecycle; prompt.go: Prompt + Cancel; logclient.go: SessionUpdate interceptor)
+pkg/storage/         — append-only event archive (Archive interface, FileArchive/MemArchive impls, Lineage traversal)
 pkg/llm/             — Registry, model resolution, provider options, type conversions
-pkg/session/         — Session struct, modes, config options
+pkg/session/         — session.State (runtime), Project(events) reducer
 pkg/instructions/    — AGENTS.md + Skills discovery, system prompt (takes acp.Client directly)
 pkg/tools/           — Fantasy agent tools (read_file, write_file, execute, plan)
 pkg/client/          — ACP client impl with real filesystem/terminal/permissions
@@ -40,12 +43,14 @@ pkg/client/          — ACP client impl with real filesystem/terminal/permissio
 
 - `llm.ModelRegistry` interface — `ResolveModel`, `ModelOptions`, `Defaults`
 - `llm.Registry` — implements ModelRegistry, loaded via `LoadRegistry(path)`
-- `session.Session` — cwd, model, thoughtLevel, mode, history, plan, usage
-- `eventlog.EventLog` / `eventlog.Store` — append-only log interfaces
-- `eventlog.Event` — one line of the log (ParentID + either `Info` or `Update`)
-- `eventlog.Reduce()` — replays events into `*session.Session`
-- `eventlog.LoggingClient` — wraps `acp.Client`, intercepts SessionUpdate to log
-- `eventlog.WithParentEventID` / `FindByMessageID` — rewind helpers (parent_event_id/parent_message_id)
+- `session.State` — runtime state: cwd, model, thoughtLevel, history, usage
+- `session.Project(events)` — replays a storage event chain into `*session.State`
+- `storage.Archive` — catalog + append log interface (Create/Delete/List/Append/Tip/Events)
+- `storage.FileArchive` / `storage.MemArchive` — durable JSONL and in-memory impls
+- `storage.EventID` — `{Session, N}`; parents may cross sessions for zero-copy forks/rewinds
+- `storage.Event` — immutable node (Parent + either `Info` header or `Update` payload)
+- `storage.Lineage(archive, tip)` — walks parent pointers across sessions, returns chronological chain
+- `agent.LoggingClient` — wraps `acp.Client`, appends non-chunk SessionUpdates to archive
 - `agent.Agent` — implements `acp.Agent` + session lifecycle interfaces
 - `instructions.Instructions` — `Discover(ctx, cwd, client, sid)` builds system prompt via the ACP client
 - `instructions.Skill` — name, description, location parsed from SKILL.md

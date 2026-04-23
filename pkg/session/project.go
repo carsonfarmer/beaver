@@ -1,65 +1,65 @@
-package eventlog
+package session
 
 import (
 	"encoding/json"
 
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/beaver/pkg/llm"
-	"github.com/carsonfarmer/beaver/pkg/session"
+	"github.com/carsonfarmer/beaver/pkg/storage"
 	acp "github.com/ironpark/go-acp"
 )
 
-// Reduce replays events to produce a complete Session.
+// Project replays an event chain to produce the session's runtime state.
 //
-// The log contains coalesced events (not streaming deltas): each
-// AgentMessageChunk, AgentThoughtChunk, and ToolCall is a complete unit.
-// The reducer only needs to group assistant parts into messages and flush
-// on role boundaries.
-func Reduce(events []Event) *session.Session {
-	r := &reducer{}
+// The chain is assumed to be in chronological order (root first, tip last)
+// — typically the output of [storage.Lineage]. Events in the chain are the
+// coalesced form: each AgentMessageChunk, AgentThoughtChunk, and ToolCall
+// is already a complete unit, so the projection only groups assistant
+// parts into messages and flushes on role boundaries.
+func Project(events []storage.Event) *State {
+	p := &projector{}
 	for i := range events {
-		r.apply(&events[i])
+		p.apply(&events[i])
 	}
-	r.flush()
-	return &r.sess
+	p.flush()
+	return &p.state
 }
 
-// reducer accumulates message parts until a role boundary forces a flush.
-type reducer struct {
-	sess  session.Session
+type projector struct {
+	state State
 	role  fantasy.MessageRole
 	parts []fantasy.MessagePart
 }
 
-// flush emits the accumulated parts as a message and resets the buffer.
-func (r *reducer) flush() {
-	if len(r.parts) == 0 {
+func (p *projector) flush() {
+	if len(p.parts) == 0 {
 		return
 	}
-	r.sess.History = append(r.sess.History, fantasy.Message{
-		Role:    r.role,
-		Content: r.parts,
+	p.state.History = append(p.state.History, fantasy.Message{
+		Role:    p.role,
+		Content: p.parts,
 	})
-	r.parts = nil
-	r.role = ""
+	p.parts = nil
+	p.role = ""
 }
 
-// start resets the buffer to begin accumulating parts for the given role.
-func (r *reducer) start(role fantasy.MessageRole) {
-	if r.role != role {
-		r.flush()
-		r.role = role
+func (p *projector) start(role fantasy.MessageRole) {
+	if p.role != role {
+		p.flush()
+		p.role = role
 	}
 }
 
-func (r *reducer) apply(ev *Event) {
+func (p *projector) apply(ev *storage.Event) {
 	if ev.Info != nil {
-		r.sess.Cwd = ev.Info.Cwd
+		if ev.Info.Cwd != "" {
+			p.state.Cwd = ev.Info.Cwd
+		}
 		if ev.Info.Title != "" {
-			r.sess.Title = ev.Info.Title
+			p.state.Title = ev.Info.Title
 		}
 		if ev.Info.UpdatedAt != "" {
-			r.sess.UpdatedAt = ev.Info.UpdatedAt
+			p.state.UpdatedAt = ev.Info.UpdatedAt
 		}
 		return
 	}
@@ -68,25 +68,25 @@ func (r *reducer) apply(ev *Event) {
 	}
 	acp.MatchSessionUpdate(ev.Update, acp.SessionUpdateMatcher[any]{
 		UserMessageChunk: func(c acp.SessionUpdateUserMessageChunk) any {
-			r.start(fantasy.MessageRoleUser)
-			appendContent(&r.parts, c.Content)
+			p.start(fantasy.MessageRoleUser)
+			appendContent(&p.parts, c.Content)
 			return nil
 		},
 		AgentMessageChunk: func(c acp.SessionUpdateAgentMessageChunk) any {
-			r.start(fantasy.MessageRoleAssistant)
-			appendContent(&r.parts, c.Content)
+			p.start(fantasy.MessageRoleAssistant)
+			appendContent(&p.parts, c.Content)
 			return nil
 		},
 		AgentThoughtChunk: func(c acp.SessionUpdateAgentThoughtChunk) any {
-			r.start(fantasy.MessageRoleAssistant)
+			p.start(fantasy.MessageRoleAssistant)
 			if t, ok := c.Content.AsText(); ok {
-				r.parts = append(r.parts, fantasy.ReasoningPart{Text: t.Text})
+				p.parts = append(p.parts, fantasy.ReasoningPart{Text: t.Text})
 			}
 			return nil
 		},
 		ToolCall: func(tc acp.SessionUpdateToolCall) any {
-			r.start(fantasy.MessageRoleAssistant)
-			r.parts = append(r.parts, fantasy.ToolCallPart{
+			p.start(fantasy.MessageRoleAssistant)
+			p.parts = append(p.parts, fantasy.ToolCallPart{
 				ToolCallID: string(tc.ToolCallID),
 				ToolName:   tc.Title,
 				Input:      string(tc.RawInput),
@@ -101,12 +101,12 @@ func (r *reducer) apply(ev *Event) {
 			if status != acp.ToolCallStatusCompleted && status != acp.ToolCallStatusFailed {
 				return nil
 			}
-			r.flush()
+			p.flush()
 			var output string
 			if len(tcu.RawOutput) > 0 {
 				json.Unmarshal(tcu.RawOutput, &output)
 			}
-			r.sess.History = append(r.sess.History, fantasy.Message{
+			p.state.History = append(p.state.History, fantasy.Message{
 				Role: fantasy.MessageRoleTool,
 				Content: []fantasy.MessagePart{fantasy.ToolResultPart{
 					ToolCallID: string(tcu.ToolCallID),
@@ -117,28 +117,26 @@ func (r *reducer) apply(ev *Event) {
 		},
 		SessionInfoUpdate: func(i acp.SessionUpdateSessionInfoUpdate) any {
 			if i.Title != "" {
-				r.sess.Title = i.Title
+				p.state.Title = i.Title
 			}
 			if i.UpdatedAt != "" {
-				r.sess.UpdatedAt = i.UpdatedAt
+				p.state.UpdatedAt = i.UpdatedAt
 			}
 			return nil
 		},
 		ConfigOptionUpdate: func(c acp.SessionUpdateConfigOptionUpdate) any {
-			applyConfigOptions(&r.sess, c.ConfigOptions)
+			applyConfigOptions(&p.state, c.ConfigOptions)
 			return nil
 		},
 		UsageUpdate: func(u acp.SessionUpdateUsageUpdate) any {
-			r.sess.UsageUsed = u.Used
-			r.sess.UsageSize = u.Size
+			p.state.UsageUsed = u.Used
+			p.state.UsageSize = u.Size
 			return nil
 		},
 		Default: func() any { return nil },
 	})
 }
 
-// appendContent adds a ContentBlock to parts, mapping to the appropriate
-// fantasy part type.
 func appendContent(parts *[]fantasy.MessagePart, content acp.ContentBlock) {
 	acp.MatchContentBlock(&content, acp.ContentBlockMatcher[any]{
 		Text: func(t acp.ContentBlockText) any {
@@ -163,8 +161,7 @@ func appendContent(parts *[]fantasy.MessagePart, content acp.ContentBlock) {
 	})
 }
 
-// applyConfigOptions merges select-typed config options into the session.
-func applyConfigOptions(s *session.Session, opts []acp.SessionConfigOption) {
+func applyConfigOptions(s *State, opts []acp.SessionConfigOption) {
 	for _, opt := range opts {
 		sel, ok := opt.AsSelect()
 		if !ok {
